@@ -1,63 +1,133 @@
-function Create-VulnTemplate {
-    param(
+# -----------------------------------------------
+# Vulnerable ADCS Lab Setup on Domain Controller
+# Includes ESC1–ESC8 attack paths
+# Run as Domain Admin on the DC (Server 2022)
+# -----------------------------------------------
+
+Import-Module ServerManager
+
+function Install-ADCSRoles {
+    Write-Host "[*] Installing ADCS & Web Enrollment on DC..." -ForegroundColor Cyan
+    Install-WindowsFeature ADCS-Cert-Authority, ADCS-Web-Enrollment -IncludeManagementTools
+    Install-AdcsCertificationAuthority -CAType EnterpriseRootCA -CryptoProviderName "RSA#Microsoft Software Key Storage Provider" `
+        -HashAlgorithmName SHA256 -KeyLength 2048 -ValidityPeriod Years -ValidityPeriodUnits 10 -CACommonName "VulnLabCA" -Force
+    Install-AdcsWebEnrollment -Force
+    Restart-Service CertSvc
+    Write-Host "[+] ADCS & Web Enrollment installed." -ForegroundColor Green
+}
+
+function Enable-SANInjection {
+    $caName = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration").'Active'
+    $caPath = "HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$caName"
+    Set-ItemProperty -Path $caPath -Name "EditFlags" -Value 0x40000  # Enables EDITF_ATTRIBUTESUBJECTALTNAME2
+    Restart-Service CertSvc
+    Write-Host "[+] Enabled SAN Injection (ESC5/ESC7)." -ForegroundColor Green
+}
+
+function Create-Template {
+    param (
         [string]$TemplateName,
         [string]$DisplayName,
         [string[]]$EKUs,
-        [bool]$EnrolleeSuppliesSubject = $true,
-        [bool]$RequiresManagerApproval = $false,
-        [bool]$PublishToCA = $true
+        [int]$EnrollmentFlags
     )
 
-    Write-Host "`n[*] Creating vulnerable template: $TemplateName" -ForegroundColor Cyan
+    Write-Host "[*] Creating template: $TemplateName..." -ForegroundColor Cyan
+
+    certutil -dstemplate "User" $TemplateName | Out-Null
+    Start-Sleep -Seconds 2
 
     $config = (Get-ADRootDSE).ConfigurationNamingContext
-    $templatePath = "CN=$TemplateName,CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,$config"
+    $ldap = "CN=$TemplateName,CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,$config"
+    $template = [ADSI]"LDAP://$ldap"
 
-    try {
-        $obj = [ADSI]"LDAP://$templatePath"
+    $template.Put("displayName", $DisplayName)
+    $template.Put("pKIEnrollmentFlag", $EnrollmentFlags)
+    $template.PutEx(2, "pKIExtendedKeyUsage", $EKUs)
+    $template.SetInfo()
 
-        if (-not $obj) {
-            Write-Host "[!] Failed to bind to template: $TemplateName" -ForegroundColor Red
-            return
-        }
-
-        # Flags
-        $flags = 0
-        if ($EnrolleeSuppliesSubject) { $flags = $flags -bor 0x10 } # ENROLLEE_SUPPLIES_SUBJECT
-        if ($RequiresManagerApproval) { $flags = $flags -bor 0x1 } # MANAGER_APPROVAL
-
-        $obj.Put("pKIEnrollmentFlag", $flags)
-        $obj.Put("displayName", $DisplayName)
-        $obj.Put("pKIExtendedKeyUsage", $EKUs)
-
-        $obj.SetInfo()
-
-        if ($PublishToCA) {
-            $ca = Get-CertificationAuthority
-            certutil -config "$env:COMPUTERNAME\$($ca.Name)" -SetCATemplates +$TemplateName
-        }
-
-    } catch {
-        Write-Host "[!] Error creating template: $_" -ForegroundColor Red
-    }
+    certutil -setcatemplates +$TemplateName | Out-Null
+    Write-Host "[+] Published $TemplateName to CA." -ForegroundColor Green
 }
 
-# Install Web Enrollment (for ESC4 / relay attacks)
-Install-WindowsFeature ADCS-Web-Enrollment -IncludeManagementTools
+function Add-TemplateACL {
+    param (
+        [string]$TemplateName,
+        [string]$Group = "Domain Users",
+        [string]$Rights = "GenericAll"
+    )
 
-# ESC1 - Enrollee supplies subject name
-Create-VulnTemplate -TemplateName "ESC1" -DisplayName "ESC1 User Template" -EKUs @(
-    "1.3.6.1.5.5.7.3.2" # Client Authentication
-) -EnrolleeSuppliesSubject $true
+    $config = (Get-ADRootDSE).ConfigurationNamingContext
+    $ldap = "CN=$TemplateName,CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,$config"
+    $acl = Get-Acl -Path ("AD:\" + $ldap)
+    $rule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+        ([System.Security.Principal.NTAccount]$Group),
+        $Rights,
+        "Allow"
+    )
+    $acl.AddAccessRule($rule)
+    Set-Acl -Path ("AD:\" + $ldap) -AclObject $acl
+    Write-Host "[+] $Group granted $Rights on $TemplateName" -ForegroundColor Yellow
+}
 
-# ESC8 - SmartCard logon
-Create-VulnTemplate -TemplateName "ESC8" -DisplayName "ESC8 SmartCard Logon" -EKUs @(
+function Add-CAACL {
+    $ca = Get-CertificationAuthority
+    Add-CertificateAuthorityAcl -Name $ca.Name -Account "Domain Users" -AccessType Enroll
+    Write-Host "[+] CA ACL modified for ESC6." -ForegroundColor Yellow
+}
+
+function Create-ESC3Template {
+    $TemplateName = "ESC3"
+    certutil -dstemplate "Machine" $TemplateName | Out-Null
+    Start-Sleep -Seconds 2
+    $config = (Get-ADRootDSE).ConfigurationNamingContext
+    $ldap = "CN=$TemplateName,CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,$config"
+    $template = [ADSI]"LDAP://$ldap"
+    $template.Put("displayName", "ESC3 Machine Abuse")
+    $template.Put("pKIEnrollmentFlag", 0x10)
+    $template.PutEx(2, "msPKI-RA-Signature", @("0"))
+    $template.SetInfo()
+    certutil -setcatemplates +$TemplateName | Out-Null
+    Write-Host "[+] ESC3 Machine template created." -ForegroundColor Green
+}
+
+function Validate-Setup {
+    Write-Host "`n[*] Validating Setup..." -ForegroundColor Cyan
+    certutil -CAInfo
+    certutil -catemplates
+    Write-Host "[+] Validation complete." -ForegroundColor Green
+}
+
+# ------------------------------
+# Start Lab Setup
+# ------------------------------
+
+Install-ADCSRoles
+Enable-SANInjection
+
+# ESC1: Enrollee supplies subject
+Create-Template -TemplateName "ESC1" -DisplayName "ESC1 EnrolleeSubject" -EKUs @("1.3.6.1.5.5.7.3.2") -EnrollmentFlags 0x10
+
+# ESC2: Template with GenericAll for Domain Users
+Create-Template -TemplateName "ESC2" -DisplayName "ESC2 WeakACL" -EKUs @("1.3.6.1.5.5.7.3.2") -EnrollmentFlags 0x10
+Add-TemplateACL -TemplateName "ESC2"
+
+# ESC3: Dangerous msPKIAccountCredentials (machine abuse)
+Create-ESC3Template
+
+# ESC4: Web Enrollment already installed in ADCS setup
+
+# ESC5 / ESC7: SubjectAltName injection
+Create-Template -TemplateName "ESC5_ESC7" -DisplayName "ESC5_ESC7 SAN Abuse" -EKUs @("1.3.6.1.5.5.7.3.2") -EnrollmentFlags 0x10
+
+# ESC6: Add Enroll ACL on CA for Domain Users
+Add-CAACL
+
+# ESC8: SmartCard EKU + ClientAuth
+Create-Template -TemplateName "ESC8" -DisplayName "ESC8 Smartcard Logon" -EKUs @(
     "1.3.6.1.4.1.311.20.2.2", # Smartcard Logon
     "1.3.6.1.5.5.7.3.2"       # Client Authentication
-) -EnrolleeSuppliesSubject $true
+) -EnrollmentFlags 0x10
 
-# ESC6 - Add enroll permissions on CA to Domain Users (weak ACL)
-$ca = Get-CertificationAuthority
-Add-CertificateAuthorityAcl -Name $ca.Name -Account "Domain Users" -AccessType Enroll
-
-Write-Host "`n[+] Vulnerable ADCS lab deployed with ESC1, ESC6, ESC8 attack vectors ready." -ForegroundColor Green
+Validate-Setup
+Write-Host "`n[✔] ADCS lab deployed on Domain Controller with ESC1–ESC8 enabled." -ForegroundColor Green
