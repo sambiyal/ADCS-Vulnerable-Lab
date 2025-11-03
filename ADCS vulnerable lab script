@@ -76,7 +76,7 @@ function Create-CertTemplate {
         certutil -setcatemplates +$Name | Out-Null
         Write-Host "[+] Template $Name created and published." -ForegroundColor Green
     } catch {
-        Write-Warning "[-] Failed to create or update template $Name: $_"
+        Write-Warning ("[-] Failed to create or update template {0}: {1}" -f $Name, $_)
     }
 }
 
