@@ -1,9 +1,3 @@
-<#
-.SYNOPSIS
-Creates a vulnerable ADCS lab environment to simulate all known ADCS abuses (ESC1-ESC8, NTLM relay).
-Author: Agent Smith
-#>
-
 function Create-VulnTemplate {
     param(
         [string]$TemplateName,
@@ -16,78 +10,54 @@ function Create-VulnTemplate {
 
     Write-Host "`n[*] Creating vulnerable template: $TemplateName" -ForegroundColor Cyan
 
-    # Duplicate the User template
-    certutil -v -dump | Out-Null
-    certtmpl.msc # GUI interaction required at this point if COM automation is limited
-
-    # The rest done via ADSI
     $config = (Get-ADRootDSE).ConfigurationNamingContext
     $templatePath = "CN=$TemplateName,CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,$config"
 
-    # Create the template
-    $obj = [ADSI]"LDAP://$templatePath"
-    if (-not $obj) {
-        Write-Host "[!] Failed to bind to template: $TemplateName" -ForegroundColor Red
-        return
-    }
+    try {
+        $obj = [ADSI]"LDAP://$templatePath"
 
-    # Set flags
-    $flags = 0
-    if ($EnrolleeSuppliesSubject) { $flags = $flags -bor 0x10 } # ENROLLEE_SUPPLIES_SUBJECT
+        if (-not $obj) {
+            Write-Host "[!] Failed to bind to template: $TemplateName" -ForegroundColor Red
+            return
+        }
 
-    $obj.Put("pKIEnrollmentFlag", $flags)
-    $obj.Put("pKIExtendedKeyUsage", $EKUs)
+        # Flags
+        $flags = 0
+        if ($EnrolleeSuppliesSubject) { $flags = $flags -bor 0x10 } # ENROLLEE_SUPPLIES_SUBJECT
+        if ($RequiresManagerApproval) { $flags = $flags -bor 0x1 } # MANAGER_APPROVAL
 
-    if ($RequiresManagerApproval) {
-        $obj.Put("pKIEnrollmentFlag", $obj.Get("pKIEnrollmentFlag") -bor 0x1) # INCLUDE_MANAGER_APPROVAL
-    }
+        $obj.Put("pKIEnrollmentFlag", $flags)
+        $obj.Put("displayName", $DisplayName)
+        $obj.Put("pKIExtendedKeyUsage", $EKUs)
 
-    $obj.SetInfo()
+        $obj.SetInfo()
 
-    # Publish template to CA
-    if ($PublishToCA) {
-        $ca = Get-CertificationAuthority
-        certutil -config "$env:COMPUTERNAME\$($ca.Name)" -SetCATemplates +$TemplateName
+        if ($PublishToCA) {
+            $ca = Get-CertificationAuthority
+            certutil -config "$env:COMPUTERNAME\$($ca.Name)" -SetCATemplates +$TemplateName
+        }
+
+    } catch {
+        Write-Host "[!] Error creating template: $_" -ForegroundColor Red
     }
 }
 
-# Install Web Enrollment (for NTLM relay)
+# Install Web Enrollment (for ESC4 / relay attacks)
 Install-WindowsFeature ADCS-Web-Enrollment -IncludeManagementTools
 
-# ESC1 - Enrollee supplies subject
-Create-VulnTemplate -TemplateName "ESC1" -DisplayName "ESC1 Template" -EKUs @(
-    "1.3.6.1.5.5.7.3.2"  # Client Authentication
+# ESC1 - Enrollee supplies subject name
+Create-VulnTemplate -TemplateName "ESC1" -DisplayName "ESC1 User Template" -EKUs @(
+    "1.3.6.1.5.5.7.3.2" # Client Authentication
 ) -EnrolleeSuppliesSubject $true
 
-# ESC2 - Over-permissive ACL
-$templatePath2 = "CN=ESC2,CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,$((Get-ADRootDSE).ConfigurationNamingContext)"
-$templateACL = Get-ACL -Path ("AD:\" + $templatePath2)
-$rule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
-    ([System.Security.Principal.NTAccount]"Authenticated Users"),
-    "GenericAll",
-    "Allow"
-)
-$templateACL.AddAccessRule($rule)
-Set-ACL -Path ("AD:\" + $templatePath2) -AclObject $templateACL
+# ESC8 - SmartCard logon
+Create-VulnTemplate -TemplateName "ESC8" -DisplayName "ESC8 SmartCard Logon" -EKUs @(
+    "1.3.6.1.4.1.311.20.2.2", # Smartcard Logon
+    "1.3.6.1.5.5.7.3.2"       # Client Authentication
+) -EnrolleeSuppliesSubject $true
 
-# ESC3 - Dangerous msPKI-AccountCredentials config is more manual (requires machine account)
-
-# ESC6 - Weak CA security descriptor (Add enroll permission on CA to low-priv group)
+# ESC6 - Add enroll permissions on CA to Domain Users (weak ACL)
 $ca = Get-CertificationAuthority
 Add-CertificateAuthorityAcl -Name $ca.Name -Account "Domain Users" -AccessType Enroll
 
-# ESC8 - SmartCard EKU, user-mapping abuse
-Create-VulnTemplate -TemplateName "ESC8" -DisplayName "ESC8 Smartcard" -EKUs @(
-    "1.3.6.1.4.1.311.20.2.2", # SmartCard Logon
-    "1.3.6.1.5.5.7.3.2"      # Client Auth
-)
-
-# ESC7 - Subject Alternative Name abuse (manual interaction required)
-
-# Misc template with dangerous EKUs + SAN
-Create-VulnTemplate -TemplateName "ESC-MISC" -DisplayName "DangerousEKU" -EKUs @(
-    "1.3.6.1.5.5.7.3.2",
-    "1.3.6.1.5.5.7.3.3"
-)
-
-Write-Host "`n[+] All vulnerable templates deployed. Lab ready for ADCS attack exercises." -ForegroundColor Green
+Write-Host "`n[+] Vulnerable ADCS lab deployed with ESC1, ESC6, ESC8 attack vectors ready." -ForegroundColor Green
